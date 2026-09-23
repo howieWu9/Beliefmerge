@@ -13,6 +13,7 @@ from torch import nn
 from beliefmerge import (
     BeliefMerge,
     DiagnosticConfig,
+    InformationConfig,
     JointBelief,
     PriorParameters,
     PublicPredictor,
@@ -27,7 +28,6 @@ from beliefmerge import (
     verify_contribution_balance,
 )
 from beliefmerge.__main__ import atomic_checkpoint, atomic_json, main, safe_load
-from beliefmerge.beliefs import stabilized_logit
 from beliefmerge.experiments import (
     ablations,
     exact_match,
@@ -96,7 +96,7 @@ def test_global_geometry_matches_explicit_svd(problem):
 @pytest.mark.parametrize("preservation", ["private_product", "equation14"])
 def test_reduced_utility_matches_full_parameter_computation(problem, preservation):
     base, tasks, info, private, _ = problem
-    cfg = StrategyConfig(preservation=preservation)
+    cfg = StrategyConfig(preservation=preservation, action_space="legacy_layerwise")
     actions = torch.tensor(
         [[0.1, 2.0], [0.8, 1.0], [1.2, 0.4]], dtype=torch.float64, requires_grad=True
     )
@@ -154,6 +154,224 @@ def test_assembly_preserves_base_buffers_and_dtype(problem):
     assert merged["counter"].data_ptr() != base["counter"].data_ptr()
 
 
+def test_global_scalar_utility_and_gradients_match_equation31(problem):
+    base, tasks, info, private, _ = problem
+    config = StrategyConfig()
+    actions = torch.tensor(
+        [[-1.3], [0.4], [2.1]], dtype=torch.float64, requires_grad=True
+    )
+    updates = torch.stack(
+        [
+            torch.cat([(task[key] - base[key]).flatten() for key in info.layer_map])
+            for task in tasks
+        ]
+    )
+    basis = updates.T @ info.basis_coefficients
+    merged = actions.squeeze(-1).softmax(0) @ updates
+    local = (merged - updates).square().sum(-1) / (
+        updates.square().sum(-1) + config.epsilon_local
+    )
+    shared = (basis.T @ merged).square().sum() / (
+        merged.square().sum() + config.epsilon_public
+    )
+    expected = (
+        -config.lambda_t * local
+        + config.lambda_o * shared
+        - config.lambda_b * actions.squeeze(-1).square()
+    )
+    utility = ReducedUtility(info, config)
+    actual = utility(actions, private.flatten(1))
+    assert torch.allclose(actual, expected, atol=1e-10)
+    assert torch.allclose(
+        torch.autograd.grad(actual.sum(), actions, retain_graph=True)[0],
+        torch.autograd.grad(expected.sum(), actions)[0],
+        atol=1e-10,
+    )
+    assert torch.equal(actual, utility(actions, private.flatten(1) * 2 - 1))
+
+
+def test_cached_scalar_response_matches_full_profiles_and_derivatives(problem):
+    _, _, info, private, _ = problem
+    utility = ReducedUtility(info, StrategyConfig())
+    actions = torch.randn(7, 3, 1, dtype=torch.float64)
+    for model in range(3):
+        cached = utility.scalar_response(actions, model)
+        candidate = torch.tensor([-2.7], dtype=torch.float64, requires_grad=True)
+        profile = actions.clone()
+        profile[:, model] = candidate
+        full = utility(profile, private.flatten(1).expand(7, -1, -1))[:, model]
+        reduced = cached(candidate)
+        assert torch.allclose(full, reduced, atol=1e-10)
+        assert torch.allclose(
+            torch.autograd.grad(full.sum(), candidate, retain_graph=True)[0],
+            torch.autograd.grad(reduced.sum(), candidate)[0],
+            atol=1e-10,
+        )
+
+
+def test_corrected_response_bound_handles_large_task_norm_disparity():
+    base = {"w": torch.zeros(1, dtype=torch.float64)}
+    tasks = [
+        {"w": torch.tensor([value], dtype=torch.float64)} for value in (0.01, 10.0)
+    ]
+    info = public_information(base, tasks, rank=1)
+    cfg = StrategyConfig()
+    utility = ReducedUtility(info, cfg)
+    scores = torch.zeros(2, 3, dtype=torch.float64)
+    zero = utility(torch.zeros(2, 1, dtype=torch.float64), scores)
+    assert float(zero[0]) < -cfg.lambda_o
+    limits = torch.tensor(
+        utility.regularity_bounds()["response_action_bounds"], dtype=torch.float64
+    )
+    assert limits[0] > (2 * cfg.lambda_o / cfg.lambda_b) ** 0.5
+    for model in range(2):
+        candidates = torch.zeros(2, 2, 1, dtype=torch.float64)
+        candidates[:, model, 0] = torch.tensor([-1.01, 1.01]) * limits[model]
+        assert (
+            utility(candidates, scores.expand(2, -1, -1))[:, model] < zero[model]
+        ).all()
+
+
+def test_raw_gaussian_samples_are_not_clipped_or_sigmoid_transformed():
+    prior = PriorParameters(torch.zeros(1), torch.eye(1), torch.eye(1))
+    belief = JointBelief(torch.zeros(3, 1), prior)
+    samples = belief.common_samples(4000, torch.Generator().manual_seed(3))
+    assert (samples < 0).any() and (samples > 1).any()
+    assert abs(float(samples.mean())) < 0.1
+    assert abs(float(samples.var()) - 2) < 0.2
+
+
+def test_fixed_prior_calibration_uses_gaussian_nll_and_freezes_predictor():
+    predictor = PublicPredictor(1, 1, architecture="linear").double()
+    with torch.no_grad():
+        for parameter in predictor.parameters():
+            parameter.zero_()
+    x = torch.tensor([[0.0], [1.0]], dtype=torch.float64)
+    y = torch.tensor([[0.2], [0.7]], dtype=torch.float64)
+    prior = PriorParameters(
+        torch.tensor([0.1], dtype=torch.float64),
+        torch.tensor([[0.3]], dtype=torch.float64),
+        torch.tensor([[0.2]], dtype=torch.float64),
+    )
+    expected = -torch.distributions.Normal(0.1, 0.5**0.5).log_prob(y).mean()
+    history = predictor.fit(x, y, split="prior_calibration", prior=prior, steps=1)
+    assert history[0] == pytest.approx(float(expected), abs=1e-7)
+    assert not predictor.training
+    assert all(not parameter.requires_grad for parameter in predictor.parameters())
+
+
+def test_current_method_rejects_legacy_ablation_labels_and_predictors(problem):
+    base, tasks, _, private, prior = problem
+    for variant in ("without_f", "without_bpi"):
+        with pytest.raises(ValueError, match="Legacy"):
+            JointBelief(torch.zeros(3, 6), prior, variant=variant)
+    merger = BeliefMerge(
+        InformationConfig(predictor_architecture="linear"),
+        StrategyConfig(steps=1, samples=2),
+    )
+    with pytest.raises(ValueError, match="linear predictor"):
+        merger.merge(base, tasks, private, PublicPredictor(3, 6), prior)
+
+
+def test_joint_optimization_updates_all_models_and_logs_warmup(problem):
+    _, _, info, _, prior = problem
+    config = StrategyConfig(
+        steps=4, samples=4, hidden=8, warmup_ratio=0.5, mode="without_nao"
+    )
+    belief = JointBelief(torch.zeros(3, 6, dtype=torch.float64), prior)
+    fit = fit_strategies(
+        belief, info.observations, ReducedUtility(info, config), config
+    )
+    assert all(row["updated_models"] == [0, 1, 2] for row in fit.trace)
+    assert fit.trace[0]["learning_rate"] == config.learning_rate / 2
+    assert fit.trace[-1]["learning_rate"] == config.learning_rate
+
+
+def test_current_plan_uses_five_seeds_linear_ablation_and_three_weight_sweeps():
+    plan = experiment_plan()
+    assert {item.seed for item in plan} == {0, 1, 2, 3, 4}
+    assert ablations()["LP"][0].predictor_architecture == "linear"
+    assert "without_bpi" not in ablations()
+    for coefficient in ("lambda_t", "lambda_o", "lambda_b"):
+        assert len([item for item in plan if item.name.startswith(coefficient)]) == 50
+
+
+def test_representation_evidence_uses_endpoint_and_excludes_ablated_passes():
+    base = nn.Sequential(
+        nn.Linear(2, 2, bias=False), nn.ReLU(), nn.Linear(2, 1, bias=False)
+    ).double()
+    with torch.no_grad():
+        base[0].weight.copy_(torch.eye(2))
+        base[2].weight.fill_(0.2)
+    task = copy.deepcopy(base)
+    with torch.no_grad():
+        task[0].weight.mul_(3)
+        task[2].weight.add_(0.4)
+    example = torch.tensor([[1.0, 2.0]], dtype=torch.float64)
+    hidden = task[:2](example).detach()
+    expected = (hidden @ (task[2].weight - base[2].weight).T).square().sum()
+    result = measure_private_information(
+        base,
+        task,
+        [example],
+        lambda model, x: model(x),
+        lambda prediction, x: prediction.square().mean(),
+        ["0", "2"],
+    )
+    assert result.representation_energy[1] == pytest.approx(float(expected.detach()))
+    assert all(not module._forward_pre_hooks for module in task.modules())
+
+
+def test_recovery_rmse_is_diagnostic_and_excludes_self_observations():
+    prior = PriorParameters(torch.zeros(1), torch.eye(1) * 0.8, torch.eye(1) * 0.2)
+    belief = JointBelief(torch.zeros(3, 1), prior)
+    observed = torch.tensor([[0.2], [0.5], [0.8]])
+    result = belief.assess_private_recovery(observed)
+    expected = [
+        (0.8 * observed[i] - observed[j]).square()
+        for i in range(3)
+        for j in range(3)
+        if i != j
+    ]
+    assert result["rmse"] == pytest.approx(float(torch.stack(expected).mean().sqrt()))
+    assert len(result["pairs"]) == 6
+    assert result["used_for_strategy_fitting"] is False
+    assert belief.predictions.count_nonzero() == 0
+
+
+def test_fixed_prior_calibration_cli_marks_coordinates_and_preserves_prior(tmp_path):
+    prior = PriorParameters(torch.zeros(2), torch.eye(2) * 0.1, torch.eye(2) * 0.2)
+    artifact = {
+        "split": "prior_calibration",
+        "predictor_model_ids": ["historical"],
+        "predictor_public": torch.randn(4, 1),
+        "predictor_private": torch.rand(4, 2),
+        "fixed_prior": prior.state_dict(),
+    }
+    torch.save(artifact, tmp_path / "input.pt")
+    main(
+        [
+            "calibrate",
+            "--input",
+            str(tmp_path / "input.pt"),
+            "--output",
+            str(tmp_path / "prior.pt"),
+            "--steps",
+            "2",
+            "--architecture",
+            "linear",
+        ]
+    )
+    output = safe_load(str(tmp_path / "prior.pt"))
+    assert output["coordinates"] == "raw"
+    assert output["calibration_method"] == "fixed_prior_marginal_gaussian_nll"
+    assert output["predictor_config"]["architecture"] == "linear"
+    assert all(
+        torch.equal(output["prior"][key], value)
+        for key, value in prior.state_dict().items()
+    )
+
+
 def test_rank_deficiency_and_zero_updates(problem):
     base, tasks, _, _, _ = problem
     identical = public_information(base, [tasks[0], tasks[0]], rank=4)
@@ -162,7 +380,7 @@ def test_rank_deficiency_and_zero_updates(problem):
     assert zero.rank == 0
     utility = ReducedUtility(zero, StrategyConfig())
     assert torch.isfinite(
-        utility(torch.zeros(2, 2, dtype=torch.float64), torch.full((2, 6), 0.5))
+        utility(torch.zeros(2, 1, dtype=torch.float64), torch.full((2, 6), 0.5))
     ).all()
 
 
@@ -175,13 +393,12 @@ def test_gaussian_posterior_and_joint_covariance():
     belief = JointBelief(torch.zeros(3, 1, dtype=torch.float64), prior)
     own = torch.tensor([0.8], dtype=torch.float64)
     mean, covariance = belief.posterior(0, own)
-    assert torch.allclose(mean, 0.8 * torch.logit(own))
+    assert torch.allclose(mean, 0.8 * own)
     assert torch.allclose(covariance, torch.tensor([[0.16]], dtype=torch.float64))
     samples = belief.conditional_samples(
         0, own, 30000, torch.Generator().manual_seed(10)
     )
-    logits = stabilized_logit(samples[:, 1:, 0])
-    observed = torch.cov(logits.T)
+    observed = torch.cov(samples[:, 1:, 0].T)
     assert abs(float(observed[0, 1]) - 0.16) < 0.015
     assert abs(float(observed[0, 0]) - 0.36) < 0.02
     assert torch.equal(samples[:, 0], own.expand(30000, 1))
@@ -193,7 +410,7 @@ def test_independent_belief_preserves_marginals_not_covariance():
     samples = belief.conditional_samples(
         0, torch.tensor([0.8]), 30000, torch.Generator().manual_seed(10)
     )
-    covariance = torch.cov(stabilized_logit(samples[:, 1:, 0]).T)
+    covariance = torch.cov(samples[:, 1:, 0].T)
     assert abs(float(covariance[0, 1])) < 0.015
     assert abs(float(covariance[0, 0]) - 0.36) < 0.02
 
@@ -219,7 +436,12 @@ def test_prior_families_and_conditional_sampling(family):
 )
 def test_belief_ablations(problem, variant):
     _, _, _, private, prior = problem
-    belief = JointBelief(torch.ones(3, 6, dtype=torch.float64), prior, variant=variant)
+    belief = JointBelief(
+        torch.ones(3, 6, dtype=torch.float64),
+        prior,
+        variant=variant,
+        coordinates="logit",
+    )
     samples = belief.fitting_samples(0, 16, torch.Generator().manual_seed(4))
     assert samples.shape == (16, 3, 6)
     if variant == "without_f":
@@ -351,7 +573,8 @@ def test_end_to_end_merge_has_no_private_type_leakage_in_fitting(problem):
     assert first.strategies.trace == second.strategies.trace
     assert torch.equal(first.actions[1:], second.actions[1:])
     assert not torch.equal(first.actions[0], second.actions[0])
-    assert torch.allclose(first.weights.sum(0), torch.ones(2))
+    assert first.weights.shape == (3, 1)
+    assert torch.allclose(first.weights.sum(0), torch.ones(1))
     assert first.metadata()["benchmark_results_verified"] is False
 
 
@@ -412,7 +635,8 @@ def test_experiment_plan_matches_current_paper_without_results():
     assert all(item.strategy.save_every == 50 for item in plan)
     assert all(item.strategy.seed == 7 for item in plan)
     assert all(
-        item.strategy.lambda_t + item.strategy.lambda_o == pytest.approx(1)
+        item.strategy.lambda_t + item.strategy.lambda_o + item.strategy.lambda_b
+        == pytest.approx(1)
         for item in plan
     )
 
@@ -468,6 +692,7 @@ def test_cli_merge_writes_only_measured_outputs(problem, tmp_path):
         {
             "split": "prior_calibration",
             "model_ids": ["cal_a", "cal_b"],
+            "coordinates": "raw",
             "predictor_config": {"input_dim": 3, "type_dim": 6, "hidden": 8},
             "predictor": predictor.state_dict(),
             "prior": prior.state_dict(),
