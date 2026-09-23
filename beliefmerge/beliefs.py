@@ -20,12 +20,23 @@ def positive_covariance(value: Tensor, floor: float = 1e-06) -> Tensor:
 
 
 class PublicPredictor(nn.Module):
-    def __init__(self, input_dim: int, type_dim: int, hidden: int = 128):
+    def __init__(
+        self,
+        input_dim: int,
+        type_dim: int,
+        hidden: int = 128,
+        architecture: str = "mlp",
+        coordinates: str = "raw",
+    ):
         super().__init__()
         if min(input_dim, type_dim, hidden) < 1:
             raise ValueError("Predictor dimensions must be positive")
         self.input_dim = input_dim
         self.type_dim = type_dim
+        if architecture not in {"mlp", "linear"} or coordinates not in {"raw", "logit"}:
+            raise ValueError("Unknown predictor architecture or score coordinates")
+        self.architecture = architecture
+        self.coordinates = coordinates
         self.register_buffer("center", torch.zeros(input_dim))
         self.register_buffer("scale", torch.ones(input_dim))
         self.network = nn.Sequential(
@@ -35,6 +46,8 @@ class PublicPredictor(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, type_dim),
         )
+        if architecture == "linear":
+            self.network = nn.Linear(input_dim, type_dim)
 
     def forward(self, observations: Tensor) -> Tensor:
         return self.network((observations - self.center) / self.scale)
@@ -47,6 +60,8 @@ class PublicPredictor(nn.Module):
         split: str,
         steps: int = 1000,
         learning_rate: float = 0.001,
+        prior: PriorParameters | None = None,
+        weight_decay: float = 0.01,
     ) -> list[float]:
         if split != "prior_calibration":
             raise ValueError(
@@ -64,7 +79,27 @@ class PublicPredictor(nn.Module):
         if steps < 1 or learning_rate <= 0:
             raise ValueError("Predictor training budget must be positive")
         x = public_train.reshape(-1, self.input_dim).to(self.center)
-        y = stabilized_logit(private_train.reshape(-1, self.type_dim)).to(self.center)
+        y = private_train.reshape(-1, self.type_dim).to(self.center)
+        if self.coordinates == "logit":
+            y = stabilized_logit(y)
+        if not torch.isfinite(y).all() or weight_decay < 0:
+            raise ValueError(
+                "Calibration scores must be finite and weight decay nonnegative"
+            )
+        if prior is None:
+            prior = PriorParameters(
+                torch.zeros(self.type_dim).to(y),
+                torch.eye(self.type_dim).to(y) / 2,
+                torch.eye(self.type_dim).to(y) / 2,
+            )
+        prior = prior.to(y)
+        factor = torch.linalg.cholesky(
+            prior.latent_covariance + prior.noise_covariance
+        ).detach()
+        mean = prior.mean.detach()
+        normalizer = 2 * factor.diag().log().sum() + self.type_dim * torch.log(
+            y.new_tensor(2 * torch.pi)
+        )
         if not torch.isfinite(x).all() or x.shape[0] < 2:
             raise ValueError("Provide at least two finite calibration observations")
         with torch.no_grad():
@@ -73,12 +108,14 @@ class PublicPredictor(nn.Module):
         self.requires_grad_(True)
         self.train()
         optimizer = torch.optim.AdamW(
-            self.parameters(), lr=learning_rate, weight_decay=0
+            self.parameters(), lr=learning_rate, weight_decay=weight_decay
         )
         history = []
         for _ in range(steps):
             optimizer.zero_grad(set_to_none=True)
-            error = (self(x) - y).square().mean()
+            residual = y - self(x) - mean
+            whitened = torch.linalg.solve_triangular(factor, residual.T, upper=False)
+            error = 0.5 * (whitened.square().sum(0).mean() + normalizer)
             if not torch.isfinite(error):
                 raise FloatingPointError("Nonfinite public-predictor objective")
             error.backward()
@@ -152,6 +189,7 @@ def calibrate_prior(
     *,
     split: str,
     covariance_floor: float = 1e-05,
+    coordinates: str = "raw",
 ) -> PriorParameters:
     if split != "prior_calibration":
         raise ValueError(
@@ -162,7 +200,14 @@ def calibrate_prior(
     groups, models, dimension = private_scores.shape
     if groups < 2 or models < 2 or covariance_floor <= 0:
         raise ValueError("At least two independent groups and two models are required")
-    residual = stabilized_logit(private_scores).double() - public_predictions.double()
+    if coordinates not in {"raw", "logit"}:
+        raise ValueError("Unknown score coordinates")
+    scores = (
+        stabilized_logit(private_scores) if coordinates == "logit" else private_scores
+    )
+    if not torch.isfinite(scores).all():
+        raise ValueError("Calibration scores must be finite")
+    residual = scores.double() - public_predictions.double()
     group_mean = residual.mean(1)
     mean = group_mean.mean(0)
     within = residual - group_mean[:, None]
@@ -185,6 +230,7 @@ class JointBelief:
         family: str = "gaussian",
         variant: str = "full",
         importance_particles: int = 4096,
+        coordinates: str = "raw",
     ):
         if predictions.ndim != 2 or predictions.shape[1] != prior.mean.numel():
             raise ValueError("Public predictions must have shape [models, type_dim]")
@@ -203,6 +249,13 @@ class JointBelief:
             raise ValueError("Unknown belief ablation")
         if importance_particles < 128:
             raise ValueError("Use at least 128 importance particles")
+        if coordinates not in {"raw", "logit"}:
+            raise ValueError("Unknown score coordinates")
+        if coordinates == "raw" and variant in {"without_f", "without_bpi"}:
+            raise ValueError(
+                "Legacy zero-predictor and fixed-type variants are not paper ablations"
+            )
+        self.coordinates = coordinates
         self.predictions = predictions.detach().clone()
         if variant == "without_f":
             self.predictions.zero_()
@@ -220,6 +273,14 @@ class JointBelief:
         self.posterior_covariance = (posterior + posterior.T) / 2
         self.posterior_factor = torch.linalg.cholesky(self.posterior_covariance)
         self.last_importance_ess: float | None = None
+
+    def _encode(self, scores: Tensor) -> Tensor:
+        if not torch.isfinite(scores).all():
+            raise ValueError("Private scores must be finite")
+        return stabilized_logit(scores) if self.coordinates == "logit" else scores
+
+    def _decode(self, scores: Tensor) -> Tensor:
+        return scores.sigmoid() if self.coordinates == "logit" else scores
 
     def _normal(self, shape: Sequence[int], generator: torch.Generator) -> Tensor:
         return torch.randn(
@@ -265,7 +326,7 @@ class JointBelief:
         noise = (
             self._normal((count, models, dimension), generator) @ self.noise_factor.T
         )
-        return torch.sigmoid(self.predictions + latent + noise)
+        return self._decode(self.predictions + latent + noise)
 
     @torch.no_grad()
     def posterior(self, model: int, own_scores: Tensor) -> tuple[Tensor, Tensor]:
@@ -273,9 +334,7 @@ class JointBelief:
             raise ValueError(
                 "Closed-form posterior is only available for Gaussian priors"
             )
-        residual = (
-            stabilized_logit(own_scores) - self.predictions[model] - self.prior.mean
-        )
+        residual = self._encode(own_scores) - self.predictions[model] - self.prior.mean
         mean = self.prior.mean + residual @ self.gain.T
         return (mean, self.posterior_covariance)
 
@@ -293,10 +352,10 @@ class JointBelief:
             raise ValueError(
                 "Own private scores must be [type_dim] or [samples,type_dim]"
             )
-        stabilized_logit(own)
+        self._encode(own)
         if self.variant == "without_bpi":
             scores = (
-                torch.sigmoid(self.predictions + self.prior.mean)
+                self._decode(self.predictions + self.prior.mean)
                 .expand(count, models, dimension)
                 .clone()
             )
@@ -314,7 +373,7 @@ class JointBelief:
                 )
             else:
                 particles = self._latent((self.importance_particles,), generator)
-                residual = stabilized_logit(own) - self.predictions[model]
+                residual = self._encode(own) - self.predictions[model]
                 difference = residual[:, None, :] - particles[None, :, :]
                 whitened = torch.linalg.solve_triangular(
                     self.noise_factor,
@@ -332,7 +391,7 @@ class JointBelief:
                 self._normal((count, models, dimension), generator)
                 @ self.noise_factor.T
             )
-            scores = torch.sigmoid(self.predictions + latent + noise)
+            scores = self._decode(self.predictions + latent + noise)
         scores[:, model] = own
         return scores
 
@@ -344,3 +403,41 @@ class JointBelief:
         if self.variant in {"full", "without_f", "without_eta"}:
             return samples
         return self.conditional_samples(model, samples[:, model], count, generator)
+
+    @torch.no_grad()
+    def assess_private_recovery(self, observed_scores: Tensor) -> dict:
+        if (
+            self.coordinates != "raw"
+            or self.family != "gaussian"
+            or self.variant != "full"
+        ):
+            raise ValueError(
+                "Analytic recovery assessment requires the full raw Gaussian model"
+            )
+        observed = observed_scores.to(self.predictions)
+        if observed.shape != self.predictions.shape or observed.shape[0] < 2:
+            raise ValueError("Recovery assessment requires all observed model types")
+        rows = []
+        squared_errors = []
+        for observer in range(len(observed)):
+            latent, _ = self.posterior(observer, observed[observer])
+            estimates = self.predictions + latent
+            for target in range(len(observed)):
+                if target == observer:
+                    continue
+                error = (estimates[target] - observed[target]).square()
+                squared_errors.append(error)
+                rows.append(
+                    {
+                        "observer": observer,
+                        "target": target,
+                        "rmse": float(error.mean().sqrt()),
+                        "estimate": estimates[target].cpu().tolist(),
+                    }
+                )
+        return {
+            "diagnostic_only": True,
+            "used_for_strategy_fitting": False,
+            "rmse": float(torch.stack(squared_errors).mean().sqrt()),
+            "pairs": rows,
+        }

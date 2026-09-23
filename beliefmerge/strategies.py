@@ -18,15 +18,18 @@ class StrategyConfig:
     hidden: int = 128
     learning_rate: float = 2e-05
     action_bound: float = 5.0
-    lambda_t: float = 0.6
-    lambda_o: float = 0.4
-    lambda_b: float = 0.04
+    lambda_t: float = 0.5
+    lambda_o: float = 0.3
+    lambda_b: float = 0.2
     epsilon_local: float = 1e-08
     epsilon_public: float = 1e-08
     save_every: int = 50
     seed: int = 0
     mode: str = "nash"
-    preservation: str = "private_product"
+    preservation: str = "equation14"
+    action_space: str = "global_scalar"
+    warmup_ratio: float = 0.05
+    max_grad_norm: float = 1.0
 
     def __post_init__(self) -> None:
         if min(self.steps, self.samples, self.hidden, self.save_every) < 1:
@@ -45,8 +48,14 @@ class StrategyConfig:
             )
         if min(self.lambda_t, self.lambda_o, self.lambda_b) < 0:
             raise ValueError("Utility coefficients cannot be negative")
-        if abs(self.lambda_t + self.lambda_o - 1) > 1e-08:
-            raise ValueError("lambda_t + lambda_o must equal one")
+        if self.action_space not in {"global_scalar", "legacy_layerwise"}:
+            raise ValueError("Unknown action space")
+        if self.action_space == "global_scalar" and self.preservation != "equation14":
+            raise ValueError("Global scalar actions require the paper utility")
+        if not 0 <= self.warmup_ratio < 1 or self.max_grad_norm <= 0:
+            raise ValueError("Invalid warmup or gradient clipping")
+        if self.action_space == "global_scalar" and self.lambda_b <= 0:
+            raise ValueError("Unbounded scalar actions require positive regularization")
         if self.mode not in {"nash", "without_nao"}:
             raise ValueError("Unknown strategy optimization mode")
         if self.preservation not in {"private_product", "equation14"}:
@@ -61,21 +70,26 @@ class ContributionStrategy(nn.Module):
         layers: int,
         hidden: int = 128,
         action_bound: float = 5.0,
+        action_space: str = "global_scalar",
     ):
         super().__init__()
         self.action_bound = action_bound
+        self.action_space = action_space
         self.network = nn.Sequential(
             nn.Linear(type_dim + public_dim, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
             nn.GELU(),
-            nn.Linear(hidden, layers),
+            nn.Linear(hidden, 1 if action_space == "global_scalar" else layers),
         )
 
     def forward(self, own_scores: Tensor, public_context: Tensor) -> Tensor:
         context = public_context.expand(*own_scores.shape[:-1], public_context.numel())
-        return self.action_bound * torch.sigmoid(
-            self.network(torch.cat([own_scores, context], -1))
+        output = self.network(torch.cat([own_scores, context], -1))
+        return (
+            output
+            if self.action_space == "global_scalar"
+            else self.action_bound * output.sigmoid()
         )
 
 
@@ -93,9 +107,31 @@ class ReducedUtility(nn.Module):
         self.components = components
         self.register_buffer("gram", information.gram.detach().clone())
         self.register_buffer("projections", information.projections.detach().clone())
+        self.register_buffer("global_gram", information.gram.sum(0).detach().clone())
+        projected = information.projections.sum(0).detach()
+        self.register_buffer("projected_gram", projected @ projected.T)
 
     def forward(self, actions: Tensor, scores: Tensor) -> Tensor:
         models, layers = (self.gram.shape[1], self.gram.shape[0])
+        if self.config.action_space == "global_scalar":
+            if actions.shape[-2:] != (models, 1):
+                raise ValueError("Global actions must end in [models,1]")
+            if scores.shape != actions.shape[:-1] + (self.components * layers,):
+                raise ValueError("Private-score dimensions do not match actions")
+            values = actions.squeeze(-1)
+            weights = values.softmax(-1)
+            cross = weights @ self.global_gram
+            norm = (weights * cross).sum(-1)
+            local = (norm[..., None] - 2 * cross + self.global_gram.diag()) / (
+                self.global_gram.diag() + self.config.epsilon_local
+            )
+            shared = (weights * (weights @ self.projected_gram)).sum(-1)
+            return (
+                -self.config.lambda_t * local
+                + self.config.lambda_o
+                * (shared / (norm + self.config.epsilon_public))[..., None]
+                - self.config.lambda_b * values.square()
+            )
         if actions.shape[-2:] != (models, layers):
             raise ValueError("Actions must end in [models,layers]")
         if scores.shape != actions.shape[:-1] + (self.components * layers,):
@@ -128,8 +164,85 @@ class ReducedUtility(nn.Module):
             - self.config.lambda_b * actions.square().sum(-1)
         )
 
+    def scalar_response(
+        self, actions: Tensor, model: int
+    ) -> Callable[[Tensor], Tensor]:
+        if self.config.action_space != "global_scalar":
+            raise ValueError("Cached responses require global scalar actions")
+        models = self.global_gram.shape[0]
+        if actions.shape[-2:] != (models, 1) or not 0 <= model < models:
+            raise ValueError("Invalid response profile or model index")
+        opponent_actions = actions.detach().squeeze(-1).clone()
+        opponent_actions[..., model] = -torch.inf
+        normalizer = opponent_actions.logsumexp(-1)
+        others = opponent_actions.softmax(-1)
+
+        def coefficients(matrix: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+            constant = (others * (others @ matrix)).sum(-1)
+            cross = others @ matrix[:, model]
+            return constant, cross, matrix[model, model]
+
+        norm_coefficients = coefficients(self.global_gram)
+        shared_coefficients = coefficients(self.projected_gram)
+        cross = others @ self.global_gram[:, model]
+        own_norm = self.global_gram[model, model]
+        cfg = self.config
+
+        def evaluate(candidate: Tensor) -> Tensor:
+            value = candidate.squeeze(-1)
+            weight = (value - normalizer).sigmoid()
+            complement = 1 - weight
+            norm = (
+                complement.square() * norm_coefficients[0]
+                + 2 * weight * complement * norm_coefficients[1]
+                + weight.square() * norm_coefficients[2]
+            )
+            shared = (
+                complement.square() * shared_coefficients[0]
+                + 2 * weight * complement * shared_coefficients[1]
+                + weight.square() * shared_coefficients[2]
+            )
+            local = (norm - 2 * (cross + weight * (own_norm - cross)) + own_norm) / (
+                own_norm + cfg.epsilon_local
+            )
+            return (
+                -cfg.lambda_t * local
+                + cfg.lambda_o * shared / (norm + cfg.epsilon_public)
+                - cfg.lambda_b * value.square()
+            )
+
+        return evaluate
+
     def regularity_bounds(self) -> dict[str, float | bool]:
         cfg = self.config
+        if cfg.action_space == "global_scalar":
+            norms = self.global_gram.diag()
+            distances = (
+                norms[:, None] + norms[None, :] - 2 * self.global_gram
+            ).clamp_min(0)
+            diameter = float(distances.max().sqrt())
+            lower = cfg.lambda_t * distances.max(1).values / (norms + cfg.epsilon_local)
+            bounds = ((lower + cfg.lambda_o) / cfg.lambda_b).sqrt()
+            curvature = 6 * cfg.lambda_t * diameter**2 / (
+                norms + cfg.epsilon_local
+            ) + cfg.lambda_o * (
+                20 * diameter**2 / cfg.epsilon_public
+                + 4 * diameter / math.sqrt(cfg.epsilon_public)
+            )
+            maximum = float(curvature.max())
+            mu = 2 * cfg.lambda_b - maximum
+            contraction = (len(norms) - 1) * maximum / mu if mu > 0 else None
+            return {
+                "curvature_bound": maximum,
+                "curvature_bound_kind": "conservative_global_chain_rule",
+                "strong_concavity": mu,
+                "contraction_bound": contraction,
+                "uniqueness_sufficient": mu > 0 and contraction < 1,
+                "response_action_bounds": bounds.cpu().tolist(),
+                "bound_definition": "sqrt((lambda_t*max_j_distance_squared/(K_mm+epsilon_local)+lambda_o)/lambda_b)",
+                "exact_equilibrium_type_independent_under_uniqueness": True,
+                "finite_optimizer_convergence_certified": False,
+            }
         layers, models, _ = self.gram.shape
         max_norm_sq = float(self.gram.sum(0).diag().max().clamp_min(0))
         gradient = (
@@ -207,6 +320,7 @@ def fit_strategies(
                     layers,
                     config.hidden,
                     config.action_bound,
+                    config.action_space,
                 )
                 for _ in range(models)
             ]
@@ -226,7 +340,7 @@ def fit_strategies(
         )
         actions = []
         for model, network in enumerate(networks):
-            if model == selected:
+            if model == selected or config.mode == "without_nao":
                 actions.append(network(types[:, model], context))
             else:
                 with torch.no_grad():
@@ -240,14 +354,30 @@ def fit_strategies(
         )
         if not torch.isfinite(objective):
             raise FloatingPointError("Nonfinite strategy utility")
-        optimizers[selected].zero_grad(set_to_none=True)
+        active = list(range(models)) if config.mode == "without_nao" else [selected]
+        for index in active:
+            optimizers[index].zero_grad(set_to_none=True)
         (-objective).backward()
-        optimizers[selected].step()
+        parameters = [
+            parameter for index in active for parameter in networks[index].parameters()
+        ]
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            parameters, config.max_grad_norm, error_if_nonfinite=True
+        )
+        warmup_steps = max(1, math.ceil(config.steps * config.warmup_ratio))
+        rate = config.learning_rate * min(1.0, step / warmup_steps)
+        for index in active:
+            for group in optimizers[index].param_groups:
+                group["lr"] = rate
+            optimizers[index].step()
         record = {
             "step": step,
             "model": selected,
             "objective": float(objective.detach()),
             "action_mean": float(action_tensor[:, selected].detach().mean()),
+            "learning_rate": rate,
+            "gradient_norm_before_clipping": float(gradient_norm),
+            "updated_models": active,
         }
         result.trace.append(record)
         if checkpoint is not None and (
@@ -294,6 +424,13 @@ def verify_contribution_balance(
     models, layers = baseline.shape
     results = []
     for model in range(models):
+        global_scalar = cfg.action_space == "global_scalar"
+        action_limit = (
+            float(bounds["response_action_bounds"][model])
+            if global_scalar
+            else cfg.action_bound
+        )
+        lower_limit = -action_limit if global_scalar else 0.0
         types = belief.conditional_samples(model, observed[model], samples, generator)
         with torch.no_grad():
             opponents = torch.stack(
@@ -304,7 +441,11 @@ def verify_contribution_balance(
                 -2,
             )
 
+        cached = utility.scalar_response(opponents, model) if global_scalar else None
+
         def objective(candidate: Tensor) -> Tensor:
+            if cached is not None:
+                return cached(candidate).mean()
             profile = opponents.clone()
             profile[:, model] = candidate
             return utility(profile, types)[:, model].mean()
@@ -320,7 +461,8 @@ def verify_contribution_balance(
                 else torch.rand(
                     own.shape, device=own.device, dtype=own.dtype, generator=generator
                 )
-                * cfg.action_bound
+                * (action_limit - lower_limit)
+                + lower_limit
             )
             candidate = nn.Parameter(start)
             optimizer = torch.optim.Adam([candidate], lr=0.05)
@@ -335,12 +477,12 @@ def verify_contribution_balance(
                 (-value).backward()
                 optimizer.step()
                 with torch.no_grad():
-                    candidate.clamp_(0, cfg.action_bound)
+                    candidate.clamp_(lower_limit, action_limit)
             value = float(objective(candidate).detach())
             if value > best_value:
                 best_value, best_action = (value, candidate.detach().clone())
         certificate = None
-        if mu > 0 and belief.family == "gaussian":
+        if mu > 0 and belief.family == "gaussian" and not global_scalar:
             delta = (own.detach() + gradient / mu).clamp(
                 0, cfg.action_bound
             ) - own.detach()
@@ -360,7 +502,7 @@ def verify_contribution_balance(
                 "candidate_action": best_action.cpu().tolist(),
                 "projected_gradient_norm": float(
                     (
-                        (own.detach() + gradient).clamp(0, cfg.action_bound)
+                        (own.detach() + gradient).clamp(lower_limit, action_limit)
                         - own.detach()
                     ).norm()
                 ),

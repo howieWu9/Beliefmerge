@@ -21,6 +21,7 @@ class InformationConfig:
     components: tuple[int, ...] = (0, 1, 2)
     family: str = "gaussian"
     belief_variant: str = "full"
+    predictor_architecture: str = "mlp"
 
     def __post_init__(self) -> None:
         if (
@@ -50,6 +51,19 @@ class MergeResult:
     def metadata(self) -> dict:
         return {
             "method": "BeliefMerge",
+            "method_version": "global-scalar-raw-gaussian-v2",
+            "belief_coordinates": self.belief.coordinates,
+            "proof_scope": "Exact best responses under verified curvature and contraction conditions; not finite AdamW updates",
+            "diagnostic_formula_assumptions": {
+                "equation5": "Squared-update Fisher energy in both numerator and denominator; configurable positive stabilizer",
+                "equation7": "Reverted-layer loss minus endpoint loss in the numerator",
+                "equation8": "Unclipped Gaussian approximation on raw score coordinates",
+            },
+            "unimplemented_paper_variants": [
+                "classical_nash_bargaining_without_BPI",
+                "GPM",
+                "GNB",
+            ],
             "information_config": asdict(self.information_config),
             "strategy_config": asdict(self.strategies.config),
             "layers": list(self.information.layers),
@@ -67,6 +81,8 @@ def assemble(
     base: State, tasks: Sequence[State], weights: Tensor, information: PublicInformation
 ) -> OrderedDict[str, Tensor]:
     validate_states(base, tasks)
+    if weights.shape == (len(tasks), 1):
+        weights = weights.expand(len(tasks), information.layer_count)
     if weights.shape != (len(tasks), information.layer_count):
         raise ValueError("Weights must have shape [models,layers]")
     if not torch.isfinite(weights).all() or (weights < 0).any():
@@ -137,6 +153,13 @@ class BeliefMerge:
             info_cfg.magnitude, info_cfg.direction, info_cfg.compatibility
         )
         public = public.to(device=self.device, dtype=torch.float32)
+        if getattr(predictor, "coordinates", "raw") != "raw":
+            raise ValueError("The current method requires raw-score calibration")
+        if (
+            info_cfg.predictor_architecture == "linear"
+            and getattr(predictor, "architecture", None) != "linear"
+        ):
+            raise ValueError("LP requires a separately calibrated linear predictor")
         indices = torch.tensor(
             [
                 component * layers + layer

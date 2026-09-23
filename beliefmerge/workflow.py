@@ -142,9 +142,9 @@ def aggregate_long_metrics(
     stage: str, request: Mapping[str, Any], result: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
     common: dict[str, Any] = {"stage": stage, "experiment_id": request["experiment_id"]}
-    for field in aggregate_IDENTITY_FIELDS:
-        value = request.get(field)
-        common[field] = (
+    for identity_field in aggregate_IDENTITY_FIELDS:
+        value = request.get(identity_field)
+        common[identity_field] = (
             aggregate_canonical(value)
             if isinstance(value, (list, dict, tuple))
             else value

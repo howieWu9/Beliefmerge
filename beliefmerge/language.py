@@ -1423,7 +1423,7 @@ def private_collect(args: argparse.Namespace) -> int:
         model, batches, base_state, endpoint_state, layer_map, layer_index, device
     )
     try:
-        model.load_state_dict(base_state, strict=True)
+        model.load_state_dict(endpoint_state, strict=True)
         representation_num, representation_den, hook_info = (
             private_representation_statistics(
                 model,
@@ -1487,6 +1487,7 @@ def private_collect(args: argparse.Namespace) -> int:
         "values": values.tolist(),
         "raw_statistics": {
             "sensitivity_fisher_weighted_update": sensitivity_raw.tolist(),
+            "representation_model": "task_endpoint",
             "representation_effect_squared": representation_num.tolist(),
             "representation_bound": representation_den.tolist(),
             "endpoint_loss": endpoint_loss,
@@ -1992,6 +1993,8 @@ def merge_sequence_models(
     if set(normalized) != set(GLUE_TASKS) or len(task_directories) != len(GLUE_TASKS):
         raise ValueError("Provide exactly one model for every GLUE task")
     calibration = safe_load(str(belief_artifact))
+    if calibration.get("coordinates") != "raw":
+        raise ValueError("Recalibrate legacy belief artifacts in raw score coordinates")
     if calibration.get("split") != "prior_calibration":
         raise ValueError("Belief artifact is not prior calibration")
     if not calibration.get("model_ids") or set(calibration["model_ids"]) & set(

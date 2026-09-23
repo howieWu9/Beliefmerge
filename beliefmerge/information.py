@@ -291,10 +291,8 @@ def measure_private_information(
         for parameter in parameters:
             parameter.requires_grad_(True)
         for index, name in enumerate(layer_modules):
-            handles.append(base_modules[name].register_forward_pre_hook(hook(index)))
+            handles.append(task_modules[name].register_forward_pre_hook(hook(index)))
         for example in examples:
-            with torch.no_grad():
-                forward(base, example)
             value = loss(forward(task, example), example)
             if value.numel() != 1 or not torch.isfinite(value):
                 raise ValueError("Local loss must be a finite scalar")
@@ -311,6 +309,9 @@ def measure_private_information(
                     grad_energy[index] += (
                         gradient.detach().double().square().sum().cpu() / len(examples)
                     )
+        for handle in handles:
+            handle.remove()
+        handles.clear()
         for index, parameter in enumerate(parameters):
             with torch.no_grad():
                 parameter.copy_(base_weights[index])

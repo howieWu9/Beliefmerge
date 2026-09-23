@@ -57,13 +57,12 @@ def ablations() -> dict[str, tuple[InformationConfig, StrategyConfig]]:
         "without_representation": {"components": (0, 2)},
         "without_performance": {"components": (0, 1)},
         "with_stability": {"components": (0, 1, 2, 3)},
-        "without_f": {"belief_variant": "without_f"},
+        "LP": {"predictor_architecture": "linear"},
         "without_bau": {"belief_variant": "without_bau"},
         "without_bef": {"belief_variant": "without_bef"},
         "without_eta": {"belief_variant": "without_eta"},
         "laplace": {"family": "laplace"},
         "student_t": {"family": "student_t"},
-        "without_bpi": {"belief_variant": "without_bpi"},
     }.items():
         output[name] = (replace(information, **updates), strategy)
     output["without_nao"] = (information, replace(strategy, mode="without_nao"))
@@ -71,7 +70,7 @@ def ablations() -> dict[str, tuple[InformationConfig, StrategyConfig]]:
 
 
 def experiment_plan(
-    seeds: Sequence[int] = (0, 1, 2),
+    seeds: Sequence[int] = (0, 1, 2, 3, 4),
     *,
     ablation_tasks: int = 20,
     sensitivity_steps: Sequence[int] = tuple((2**i for i in range(1, 12))),
@@ -114,28 +113,27 @@ def experiment_plan(
                         strategy=strategy,
                     )
                 )
-            for weight in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0):
-                plan.append(
-                    Experiment(
-                        f"lambda_t_{weight}",
-                        backbone,
-                        CLIP_TASKS,
-                        seed,
-                        strategy=replace(
-                            strategy, lambda_t=weight, lambda_o=1 - weight
-                        ),
+            reference = {"lambda_t": 0.5, "lambda_o": 0.3, "lambda_b": 0.2}
+            for coefficient, values in {
+                "lambda_t": (0.1, 0.3, 0.5, 0.7, 0.9),
+                "lambda_o": (0.1, 0.2, 0.3, 0.4, 0.5),
+                "lambda_b": (0.1, 0.2, 0.3, 0.4, 0.5),
+            }.items():
+                for weight in values:
+                    weights = {
+                        key: value * (1 - weight) / (1 - reference[coefficient])
+                        for key, value in reference.items()
+                    }
+                    weights[coefficient] = weight
+                    plan.append(
+                        Experiment(
+                            f"{coefficient}_{weight}",
+                            backbone,
+                            CLIP_TASKS,
+                            seed,
+                            strategy=replace(strategy, **weights),
+                        )
                     )
-                )
-            for weight in (0.0, 0.02, 0.04, 0.06, 0.08, 0.1):
-                plan.append(
-                    Experiment(
-                        f"lambda_b_{weight}",
-                        backbone,
-                        CLIP_TASKS,
-                        seed,
-                        strategy=replace(strategy, lambda_b=weight),
-                    )
-                )
         for step in sensitivity_steps:
             if step < 1:
                 raise ValueError("Training steps must be positive")

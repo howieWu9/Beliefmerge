@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, Subset
 from .__main__ import atomic_checkpoint
 
 PRIVATE_TYPE_COMPONENTS = ("s_sens", "s_repr", "s_util", "s_stab")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -372,7 +372,7 @@ def _representation_statistics(
 
         handles.append(module.register_forward_pre_hook(hook))
     try:
-        encoder.load_state_dict(base_state, strict=True)
+        encoder.load_state_dict(endpoint_state, strict=True)
         encoder.eval()
         head.eval()
         for images_cpu, _ in batches:
@@ -577,6 +577,7 @@ def measure_private_types(
     values = np.clip(values, 1e-5, 1.0 - 1e-5)
     samples = sum((int(labels.numel()) for _, labels in batches))
     raw = {
+        "representation_model": "task_endpoint",
         "sensitivity_fisher_weighted_update": sensitivity_raw.tolist(),
         "representation_effect_squared": representation_num.tolist(),
         "representation_bound": representation_den.tolist(),
